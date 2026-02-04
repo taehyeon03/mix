@@ -1,4 +1,45 @@
 #!/usr/bin/env python
+"""
+SmolVLA 모델 병합 스크립트
+
+두 개의 SmolVLA 정책을 다양한 알고리즘으로 병합합니다.
+지원 알고리즘: weighted_average, TATallMask, ties_TallMask
+
+사용 예시:
+
+1. Weighted Average (가중 평균):
+   python lerobot_merge_smolvla.py merge \
+     --repos user/model1,user/model2 \
+     --algo_name weighted_average \
+     --weight 0.5 \
+     --output_dir outputs/merged_wa \
+     --debug
+
+2. TallMask Task Arithmetic:
+   python lerobot_merge_smolvla.py merge \
+     --repos user/model1,user/model2 \
+     --algo_name TATallMask \
+     --tall_mask_lambda 0.6 \
+     --output_dir outputs/merged_ta_tallmask \
+     --debug
+
+3. TallMask Ties Merging:
+   python lerobot_merge_smolvla.py merge \
+     --repos user/model1,user/model2 \
+     --algo_name ties_TallMask \
+     --tall_mask_lambda 0.6 \
+     --output_dir outputs/merged_ties_tallmask \
+     --debug
+
+4. 병합 후 Hugging Face Hub에 업로드 (항상 public):
+   python lerobot_merge_smolvla.py merge \
+     --repos user/model1,user/model2 \
+     --algo_name weighted_average \
+     --weight 0.5 \
+     --output_dir outputs/merged_wa \
+     --push_to_hub \
+     --repo_id user/merged-smolvla
+"""
 
 import argparse
 import logging
@@ -55,7 +96,13 @@ def parse_args() -> argparse.Namespace:
         "--weight",
         type=float,
         default=CFG.default_weight,
-        help="첫 번째 모델 가중치 w (두 번째는 1-w). 기본값 0.5.",
+        help="첫 번째 모델 가중치 w (두 번째는 1-w). 기본값 0.5. weighted_average 알고리즘에서만 사용.",
+    )
+    merge_parser.add_argument(
+        "--tall_mask_lambda",
+        type=float,
+        default=CFG.tall_mask_lambda,
+        help="TallMask 알고리즘에서 사용하는 lambda 하이퍼파라미터. 기본값 0.6. TATallMask, ties_TallMask에서 사용.",
     )
     merge_parser.add_argument(
         "--output_dir",
@@ -63,21 +110,33 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="머지된 SmolVLA 정책을 저장할 로컬 경로.",
     )
+    def str_to_bool(v):
+        """--push_to_hub true/false만 받음. 플래그만 주면 True."""
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return True  # 플래그만 주면 True
+        v_lower = v.lower()
+        if v_lower == "true":
+            return True
+        elif v_lower == "false":
+            return False
+        else:
+            raise argparse.ArgumentTypeError(f"--push_to_hub는 'true' 또는 'false'만 받습니다. 받은 값: {v}")
+
     merge_parser.add_argument(
         "--push_to_hub",
-        action="store_true",
-        help="설정 시, 머지된 모델을 허깅페이스 허브에 업로드.",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="허깅페이스 허브에 업로드 여부. --push_to_hub 또는 --push_to_hub true/false (기본값: false).",
     )
     merge_parser.add_argument(
-        "--hub_repo_id",
+        "--repo_id",
         type=str,
         default=None,
         help="업로드할 허깅페이스 repo id (예: user/merged-smolvla). 지정하지 않으면 첫 번째 모델의 repo_id를 사용하려 시도.",
-    )
-    merge_parser.add_argument(
-        "--hub_private",
-        action="store_true",
-        help="허깅페이스 repo를 private으로 생성.",
     )
     merge_parser.add_argument(
         "--debug",
@@ -264,6 +323,7 @@ def _merge_with_algo(
     policy2: SmolVLAPolicy,
     algo_name: str,
     weight: float,
+    tall_mask_lambda: float = 0.6,
     debug: bool = False,
 ) -> SmolVLAPolicy:
     """
@@ -344,7 +404,7 @@ def _merge_with_algo(
             mask = _generate_task_masks(
                 OrderedDict((k, multi_tv[k]) for k in keys),
                 OrderedDict((k, tv[k]) for k in keys),
-                tall_mask_lambda=CFG.tall_mask_lambda,
+                tall_mask_lambda=tall_mask_lambda,
             )
             tall_masks[name] = mask
 
@@ -387,7 +447,7 @@ def _merge_with_algo(
             mask = _generate_task_masks(
                 OrderedDict((k, merged_tv[k]) for k in keys),
                 OrderedDict(tv_cast),
-                tall_mask_lambda=CFG.tall_mask_lambda,
+                tall_mask_lambda=tall_mask_lambda,
             )
             tall_masks[name] = mask
 
@@ -409,8 +469,9 @@ def _push_merged_to_hub(
     policy: SmolVLAPolicy,
     output_dir: Path,
     repo_id: str | None,
-    private: bool,
+    private: bool | None,
 ) -> None:
+    """머지된 모델을 Hugging Face Hub에 업로드 (항상 public)."""
     api = HfApi()
 
     if repo_id is None:
@@ -418,8 +479,8 @@ def _push_merged_to_hub(
         repo_id = getattr(policy.config, "repo_id", None)
         if repo_id is None:
             raise ValueError(
-                "hub_repo_id를 지정하지 않았고 policy.config.repo_id도 없습니다. "
-                "--hub_repo_id를 명시적으로 전달하세요."
+                "repo_id를 지정하지 않았고 policy.config.repo_id도 없습니다. "
+                "--repo_id를 명시적으로 전달하세요."
             )
 
     created = api.create_repo(repo_id=repo_id, private=private, exist_ok=True)
@@ -459,16 +520,18 @@ def main() -> None:
     policy2 = SmolVLAPolicy.from_pretrained(repo2)
 
     logger.info(
-        "Merging trainable parameters only with algo=%s (w=%.3f, 1-w=%.3f)",
+        "Merging trainable parameters only with algo=%s (w=%.3f, 1-w=%.3f, tall_mask_lambda=%.2f)",
         args.algo_name,
         args.weight,
         1 - args.weight,
+        args.tall_mask_lambda,
     )
     merged_policy = _merge_with_algo(
         policy1,
         policy2,
         algo_name=args.algo_name,
         weight=args.weight,
+        tall_mask_lambda=args.tall_mask_lambda,
         debug=args.debug,
     )
 
@@ -478,12 +541,12 @@ def main() -> None:
     merged_policy.save_pretrained(output_dir)
 
     if args.push_to_hub:
-        logger.info("Pushing merged policy to Hugging Face Hub")
+        logger.info("Pushing merged policy to Hugging Face Hub (public)")
         _push_merged_to_hub(
             merged_policy,
             output_dir=output_dir,
-            repo_id=args.hub_repo_id,
-            private=args.hub_private,
+            repo_id=args.repo_id,
+            private=None,  # 항상 public으로 업로드
         )
 
 
