@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 import torch
 from torch import Tensor, nn
 from tqdm import tqdm
@@ -175,13 +175,17 @@ def _state_dict_sub(a: StateDict, b: StateDict, exclude_keys: List[str] | None =
 
 
 def _state_dict_add(a: StateDict, b: StateDict, exclude_keys: List[str] | None = None) -> StateDict:
+    """a + b, exclude_keys는 a의 값을 그대로 사용. b에 없는 키는 a만 사용."""
     ek = set(exclude_keys or [])
     out: StateDict = {}
     for k in a.keys():
         if k in ek:
             out[k] = a[k]
-        else:
+        elif k in b:
             out[k] = a[k] + b[k]
+        else:
+            # b에 없는 키는 a만 사용 (exclude_keys가 아니면 경고)
+            out[k] = a[k]
     return out
 
 
@@ -319,8 +323,7 @@ def _ties_merging(flat_task_checks: Tensor, reset_thresh: float, merge_func: str
 
 
 def _merge_with_algo(
-    policy1: SmolVLAPolicy,
-    policy2: SmolVLAPolicy,
+    policies: List[SmolVLAPolicy],
     algo_name: str,
     weight: float,
     tall_mask_lambda: float = 0.6,
@@ -331,21 +334,33 @@ def _merge_with_algo(
     - weighted_average: fusion_bench WeightedAverageAlgorithm 사용
     - TATallMask / ties_TallMask: MergeVLA의 get_algo를 그대로 재사용
     """
-    # trainable 파라미터만 merge하도록 exclude_keys 구성
-    trainable1 = _get_trainable_param_names(policy1)
-    trainable2 = _get_trainable_param_names(policy2)
-    trainable_keys = trainable1 & trainable2
+    if len(policies) < 2 or len(policies) > 4:
+        raise ValueError(f"policies 길이는 2~4개만 지원합니다. 받은 개수: {len(policies)}")
 
-    all_keys = list(policy1.state_dict().keys())
+    # ---------------------------------------------------------
+    # 1) trainable 파라미터 교집합 계산 (모든 모델 공통 trainable만 병합)
+    # ---------------------------------------------------------
+    trainable_sets = [_get_trainable_param_names(p) for p in policies]
+    trainable_keys = set.intersection(*trainable_sets)
+
+    sd_list = [p.state_dict() for p in policies]
+    sd_pre = sd_list[0]  # baseline: 첫 번째 모델 (향후 필요 시 별도 pretrained로 확장 가능)
+
+    all_keys = list(sd_pre.keys())
     exclude_keys = [k for k in all_keys if k not in trainable_keys]
 
-    sd1 = policy1.state_dict()
-    sd2 = policy2.state_dict()
-
-    # baseline은 간단히 policy1으로 사용 (추후 필요하면 별도 repo를 받도록 확장 가능)
-    sd_pre = sd1
-
+    # ---------------------------------------------------------
+    # 2) weighted_average: 현재는 2개 모델만 지원 (명확한 의미를 위해)
+    # ---------------------------------------------------------
     if algo_name == "weighted_average":
+        if len(policies) != 2:
+            raise ValueError(
+                "weighted_average 알고리즘은 현재 2개 모델 병합만 지원합니다. "
+                f"받은 모델 수: {len(policies)}"
+            )
+
+        sd1, sd2 = sd_list
+
         w1 = float(weight)
         w2 = 1.0 - w1
         merged_sd: StateDict = {}
@@ -384,22 +399,35 @@ def _merge_with_algo(
                 )
             logger.info("===================================================")
 
-        out = SmolVLAPolicy(policy1.config)
+        out = SmolVLAPolicy(policies[0].config)
         out.load_state_dict(merged_sd)
         out.to("cpu")
         return out
 
-    # 공통: task vector 계산
-    tv1 = _state_dict_sub(sd1, sd_pre, exclude_keys=exclude_keys)
-    tv2 = _state_dict_sub(sd2, sd_pre, exclude_keys=exclude_keys)
-    task_vectors = {"model_0": tv1, "model_1": tv2}
-    keys = _sd_keys_intersection([tv1, tv2])
+    # ---------------------------------------------------------
+    # 3) Task vector 기반 알고리즘: TATallMask / ties_TallMask
+    #    - 원 MergeVLA 스타일로 N(2~4)개 모델까지 일반화
+    # ---------------------------------------------------------
+    tv_list = [
+        _state_dict_sub(sd, sd_pre, exclude_keys=exclude_keys)
+        for sd in sd_list
+    ]
+    task_vectors = {f"model_{i}": tv for i, tv in enumerate(tv_list)}
+    keys = _sd_keys_intersection(tv_list)
 
+    # 3-1) TallMask Task Arithmetic (TATallMask)
+    # trainable 파라미터만 merge하도록 exclude_keys 구성
     if algo_name == "TATallMask":
-        # multi-task vector = sum of task vectors
-        multi_tv = _state_dict_sum([tv1, tv2])
+        # multi-task vector = sum of all task vectors (원 MergeVLA 스타일)
+        multi_tv = _state_dict_sum(tv_list)
 
+        # 각 task에 대해 TallMask를 계산하고, 해당 task vector를 마스킹한 뒤
+        # 모든 masked task vector를 합산하여 최종 multi-task vector를 구성.
+        #   - mask_t = |θ_t| > λ |θ_mt - θ_t|
+        #   - masked_tv_t = θ_t * mask_t
+        #   - multi_tv_masked = sum_t masked_tv_t
         tall_masks = {}
+        masked_tvs: List[StateDict] = []
         for name, tv in tqdm(task_vectors.items(), desc="Generating TallMasks (TA)", total=len(task_vectors)):
             mask = _generate_task_masks(
                 OrderedDict((k, multi_tv[k]) for k in keys),
@@ -407,15 +435,27 @@ def _merge_with_algo(
                 tall_mask_lambda=tall_mask_lambda,
             )
             tall_masks[name] = mask
+            masked_tv = _state_dict_hadamard(mask, tv)
+            masked_tvs.append(masked_tv)
 
-        # eval_task를 쓰지 않으므로, 원 구현의 "eval_model_name is None" 분기처럼
-        # multi-task vector 자체를 최종 weight로 사용.
-        final_sd = _state_dict_add(sd_pre, multi_tv, exclude_keys=exclude_keys)
+        multi_tv_masked = _state_dict_sum(masked_tvs)
+
+        # baseline(sd_pre)에 TallMask가 적용된 multi-task vector를 더해 최종 weight 구성
+        final_sd = _state_dict_add(sd_pre, multi_tv_masked, exclude_keys=exclude_keys)
+
+        # 모든 키가 포함되었는지 검증
+        if set(final_sd.keys()) != set(sd_pre.keys()):
+            missing = set(sd_pre.keys()) - set(final_sd.keys())
+            logger.warning("TATallMask: final_sd에 누락된 키가 있습니다: %s", missing)
+            # 누락된 키는 sd_pre에서 복사
+            for k in missing:
+                final_sd[k] = sd_pre[k]
 
         if debug:
             logger.info("TallMaskTaskArithmetic: generated masks for models: %s", list(tall_masks.keys()))
+            logger.info("TATallMask: final_sd 키 개수=%d, sd_pre 키 개수=%d", len(final_sd), len(sd_pre))
 
-        out = SmolVLAPolicy(policy1.config)
+        out = SmolVLAPolicy(policies[0].config)
         out.load_state_dict(final_sd)
         out.to("cpu")
         return out
@@ -424,8 +464,8 @@ def _merge_with_algo(
         # TIES: 벡터 공간에서 task vector 합성을 수행
         flat_ft = torch.vstack(
             [
-                _state_dict_to_vector(sd1, remove_keys=exclude_keys),
-                _state_dict_to_vector(sd2, remove_keys=exclude_keys),
+                _state_dict_to_vector(sd, remove_keys=exclude_keys)
+                for sd in sd_list
             ]
         )
         flat_ptm = _state_dict_to_vector(sd_pre, remove_keys=exclude_keys)
@@ -439,30 +479,49 @@ def _merge_with_algo(
             if isinstance(v, nn.Parameter):
                 merged_tv[k] = v.detach().clone()
 
-        # Tall mask 생성
-        tall_masks = {}
-        for name, tv in tqdm(task_vectors.items(), desc="Generating TallMasks (TIES)", total=len(task_vectors)):
-            # dtype 일치
-            tv_cast = {k: tv[k].to(merged_tv[k].dtype) for k in keys}
-            mask = _generate_task_masks(
-                OrderedDict((k, merged_tv[k]) for k in keys),
-                OrderedDict(tv_cast),
-                tall_mask_lambda=tall_mask_lambda,
-            )
-            tall_masks[name] = mask
-
         # eval_task 없이 merged_tv 자체를 최종 weight로 사용
         final_sd = _state_dict_add(sd_pre, merged_tv, exclude_keys=exclude_keys)
 
-        if debug:
-            logger.info("TallMaskTiesMerging: generated masks for models: %s", list(tall_masks.keys()))
+        # 모든 키가 포함되었는지 검증
+        if set(final_sd.keys()) != set(sd_pre.keys()):
+            missing = set(sd_pre.keys()) - set(final_sd.keys())
+            logger.warning("ties_TallMask: final_sd에 누락된 키가 있습니다: %s", missing)
+            # 누락된 키는 sd_pre에서 복사
+            for k in missing:
+                final_sd[k] = sd_pre[k]
 
-        out = SmolVLAPolicy(policy1.config)
+        out = SmolVLAPolicy(policies[0].config)
         out.load_state_dict(final_sd)
         out.to("cpu")
         return out
 
     raise ValueError(f"Unknown algo_name: {algo_name}")
+
+
+def _copy_preprocessor_postprocessor_from_repo(
+    source_repo_id: str,
+    output_dir: Path,
+) -> None:
+    """원본 모델에서 preprocessor/postprocessor 파일들을 다운로드해서 output_dir에 복사."""
+    processor_files = [
+        "policy_preprocessor.json",
+        "policy_preprocessor_step_5_normalizer_processor.safetensors",
+        "policy_postprocessor.json",
+        "policy_postprocessor_step_0_unnormalizer_processor.safetensors",
+    ]
+
+    logger.info("Copying preprocessor/postprocessor from %s", source_repo_id)
+    for filename in processor_files:
+        try:
+            local_path = hf_hub_download(
+                repo_id=source_repo_id,
+                filename=filename,
+                local_dir=str(output_dir),
+                local_dir_use_symlinks=False,
+            )
+            logger.info("Copied %s to %s", filename, output_dir)
+        except Exception as e:
+            logger.warning("Failed to copy %s from %s: %s", filename, source_repo_id, e)
 
 
 def _push_merged_to_hub(
@@ -496,6 +555,61 @@ def _push_merged_to_hub(
     )
 
 
+def _ensure_model_card(
+    output_dir: Path,
+    repos: List[str],
+    algo_name: str,
+    weight: float,
+    tall_mask_lambda: float,
+) -> None:
+    """
+    Hugging Face Hub에 업로드할 때 사용할 기본 모델 카드(README.md)를 생성.
+    - 이미 README.md 가 있으면 건드리지 않음.
+    - lerobot / SmolVLA / 머지 설정 정도만 간단히 기록.
+    """
+    readme_path = output_dir / "README.md"
+    if readme_path.exists():
+        return
+
+    base_models = ", ".join(repos)
+    # base_model 필드는 단일 모델 ID만 허용하므로 제거 (여러 모델은 README 본문에만 기록)
+    lines = [
+        "---",
+        "tags:",
+        "  - robotics",
+        "  - lerobot",
+        "  - smolvla",
+        "  - merged-model",
+        "library_name: lerobot",
+        "license: apache-2.0",
+        "language:",
+        "  - en",
+        "  - ko",
+        "---",
+        "",
+        "# Merged SmolVLA",
+        "",
+        "여러 SmolVLA 정책을 병합 알고리즘으로 합쳐 만든 모델입니다.",
+        "",
+        "## Base models",
+    ]
+    # 각 모델을 별도 리스트 아이템으로 표시
+    for repo in repos:
+        lines.append(f"- {repo}")
+    lines.extend([
+        "",
+        "## Merge config",
+        f"- algo_name: `{algo_name}`",
+        f"- weight: `{weight:.3f}`",
+        f"- tall_mask_lambda: `{tall_mask_lambda:.3f}`",
+        "",
+        "_This README was auto-generated by `lerobot_merge_smolvla.py`. 수정해서 사용해도 됩니다._",
+        "",
+    ])
+
+    readme_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
@@ -510,25 +624,22 @@ def main() -> None:
         )
 
     repos = [r.strip() for r in args.repos.split(",") if r.strip()]
-    if len(repos) != 2:
-        raise ValueError(f"--repos 는 반드시 두 개의 repo id를 콤마로 구분해서 전달해야 합니다. 받은 값: {args.repos}")
+    if not (2 <= len(repos) <= 4):
+        raise ValueError(
+            f"--repos 는 2~4개의 repo id를 콤마로 구분해서 전달해야 합니다. 받은 값: {args.repos}"
+        )
 
-    repo1, repo2 = repos
-    logger.info("Loading SmolVLA policies from: %s, %s", repo1, repo2)
-
-    policy1 = SmolVLAPolicy.from_pretrained(repo1)
-    policy2 = SmolVLAPolicy.from_pretrained(repo2)
+    logger.info("Loading SmolVLA policies from: %s", ", ".join(repos))
+    policies = [SmolVLAPolicy.from_pretrained(r) for r in repos]
 
     logger.info(
-        "Merging trainable parameters only with algo=%s (w=%.3f, 1-w=%.3f, tall_mask_lambda=%.2f)",
+        "Merging trainable parameters only with algo=%s (w=%.3f, tall_mask_lambda=%.2f)",
         args.algo_name,
         args.weight,
-        1 - args.weight,
         args.tall_mask_lambda,
     )
     merged_policy = _merge_with_algo(
-        policy1,
-        policy2,
+        policies,
         algo_name=args.algo_name,
         weight=args.weight,
         tall_mask_lambda=args.tall_mask_lambda,
@@ -539,6 +650,20 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Saving merged policy to %s", output_dir)
     merged_policy.save_pretrained(output_dir)
+
+    # 원본 모델에서 preprocessor/postprocessor 복사 (lerobot 형식)
+    # 여러 모델을 병합하는 경우, 첫 번째 모델의 processor를 기준으로 사용
+    logger.info("Copying preprocessor/postprocessor from source model (first repo: %s)", repos[0])
+    _copy_preprocessor_postprocessor_from_repo(repos[0], output_dir)
+
+    # 기본 모델 카드(README.md)가 없으면 자동 생성
+    _ensure_model_card(
+        output_dir=output_dir,
+        repos=repos,
+        algo_name=args.algo_name,
+        weight=args.weight,
+        tall_mask_lambda=args.tall_mask_lambda,
+    )
 
     if args.push_to_hub:
         logger.info("Pushing merged policy to Hugging Face Hub (public)")
