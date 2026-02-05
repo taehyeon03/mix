@@ -328,6 +328,7 @@ def _merge_with_algo(
     weight: float,
     tall_mask_lambda: float = 0.6,
     debug: bool = False,
+    baseline_policy: SmolVLAPolicy | None = None,
 ) -> SmolVLAPolicy:
     """
     Merge 두 SmolVLA 정책을 fusion_bench 알고리즘(TA TallMask / ties TallMask / weighted_average)으로 병합.
@@ -344,7 +345,16 @@ def _merge_with_algo(
     trainable_keys = set.intersection(*trainable_sets)
 
     sd_list = [p.state_dict() for p in policies]
-    sd_pre = sd_list[0]  # baseline: 첫 번째 모델 (향후 필요 시 별도 pretrained로 확장 가능)
+
+    # baseline 설정
+    # - baseline_policy 가 주어지면 해당 모델을 논문 스타일의 공통 pretrained 베이스로 사용
+    # - None 이면 기존처럼 첫 번째 모델을 baseline으로 사용
+    if baseline_policy is not None:
+        logger.info("Using explicit baseline policy (공통 SmolVLA 베이스) for task vectors.")
+        sd_pre = baseline_policy.state_dict()
+    else:
+        logger.info("No explicit baseline policy provided. Using first policy as baseline.")
+        sd_pre = sd_list[0]
 
     all_keys = list(sd_pre.keys())
     exclude_keys = [k for k in all_keys if k not in trainable_keys]
@@ -638,12 +648,17 @@ def main() -> None:
         args.weight,
         args.tall_mask_lambda,
     )
+    # MergeVLA 논문 스타일로 고정: 항상 공통 SmolVLA 베이스를 baseline으로 사용
+    baseline_repo = "lerobot/smolvla_base"
+    logger.info("Loading baseline SmolVLA policy from fixed repo: %s", baseline_repo)
+    baseline_policy = SmolVLAPolicy.from_pretrained(baseline_repo)
     merged_policy = _merge_with_algo(
         policies,
         algo_name=args.algo_name,
         weight=args.weight,
         tall_mask_lambda=args.tall_mask_lambda,
         debug=args.debug,
+        baseline_policy=baseline_policy,
     )
 
     output_dir = Path(args.output_dir)
